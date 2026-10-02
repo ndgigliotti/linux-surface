@@ -1,0 +1,23 @@
+[Unit]
+Description=Surface Laptop Studio 2 NVIDIA auxiliary-power workaround
+After=systemd-udev-settle.service
+ConditionPathExists=/dev/nvidia0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/surface-nvidia-power.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+PrivateTmp=true
+DevicePolicy=closed
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia0 rw
+
+[Install]
+WantedBy=multi-user.target

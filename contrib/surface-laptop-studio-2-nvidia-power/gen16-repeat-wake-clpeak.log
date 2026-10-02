@@ -1,0 +1,15 @@
+
+=== OpenCL backend ===
+
+Platform: NVIDIA CUDA
+  Device: NVIDIA GeForce RTX 4060 Laptop GPU
+    Driver version  : 595.71.05 (Linux x64)
+    Compute units   : 24
+    Clock frequency : 2010 MHz
+
+    Single-precision compute (GFLOPS)
+      float   : 13634.73
+      float2  : 13911.66
+      float4  : 13637.85
+      float8  : 13451.57
+      float16 : 12975.72

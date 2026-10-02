@@ -1,0 +1,25 @@
+{
+  "boot_id": "a0e90893-1440-4265-8d4a-061a27301200",
+  "toplevel": "/nix/store/b75rp8wjjxnqd7zd2mw94z1nfjmx3cvp-nixos-system-tincan-26.05.20260926.5e2305d",
+  "steady_samples": 13,
+  "steady_draw_w_range": [
+    59.91,
+    60.09
+  ],
+  "steady_clocks_mhz_range": [
+    2205.0,
+    2430.0
+  ],
+  "temperature_peak_c": 66.0,
+  "float_gflops": 14253.84,
+  "repeat_float_gflops": 13634.73,
+  "post_idle": {
+    "post_state": "D3cold",
+    "post_runtime": "suspended"
+  },
+  "repeat_post_idle": {
+    "power_state": "D3cold",
+    "runtime_status": "suspended"
+  },
+  "scope": "Original Surface Connect charger; battery/live transitions previously passed with identical executable helper code. Dock/system suspend/electrical savings not yet validated."
+}
