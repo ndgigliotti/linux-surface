@@ -134,13 +134,17 @@ def apply_power_source(online):
     with rm_device() as (fd, client, obj):
         # Re-read after allocation: the charger may have changed while RM was
         # resuming. SET_POWERSTATE retains NVIDIA's native AC/battery policy.
-        source = 0 if text(AC) == "1" else 1
+        online = text(AC)
+        if online not in ("0", "1"):
+            raise RuntimeError("Unknown AC state")
+        source = 0 if online == "1" else 1
         control(fd, client, obj, 0x2080205B, source)
         control(fd, client, obj, 0x20802092, 0)
         reported = control(fd, client, obj, 0x2080205A, 0xFFFFFFFF)
         if reported != source:
             raise RuntimeError(f"Power-source readback mismatch {source} != {reported}")
         log(event="applied", source="AC" if source == 0 else "battery", auxiliary="P0")
+    return online
 
 
 def restore_firmware_restriction():
@@ -163,8 +167,9 @@ def main():
             if epoch is None:
                 previous = None
             elif epoch != previous:
-                apply_power_source(epoch[1])
-                previous = epoch
+                applied_online = apply_power_source(epoch[1])
+                # Allocation may have observed a different source than epoch.
+                previous = (epoch[0], applied_online)
             stopping.wait(0.2)
     finally:
         restore_firmware_restriction()

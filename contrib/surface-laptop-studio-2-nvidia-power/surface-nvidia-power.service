@@ -1,10 +1,13 @@
 [Unit]
 Description=Surface Laptop Studio 2 NVIDIA auxiliary-power workaround
-After=systemd-udev-settle.service
-ConditionPathExists=/dev/nvidia0
+# Retry missing device nodes even if creation takes longer than the start limit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# These checks only stat the nodes; they do not open or wake the GPU.
+ExecStartPre=/usr/bin/test -c /dev/nvidiactl
+ExecStartPre=/usr/bin/test -c /dev/nvidia0
 ExecStart=/usr/bin/python3 /usr/local/libexec/surface-nvidia-power.py
 Restart=on-failure
 RestartSec=3
