@@ -54,13 +54,16 @@ class HardwareFreeTests(unittest.TestCase):
 class SuspendCounterTests(HardwareFreeTests):
     def test_counter_values_and_unavailable_fallback(self):
         for readings, expected in ((["12", "3"], (12, 3)),
+                                   (["12", FileNotFoundError("fail unavailable")], None),
                                    ([FileNotFoundError("unavailable")], None),
                                    ([OSError("restricted")], None), (["unknown"], None)):
             with self.subTest(readings=readings), \
-                 patch.object(power, "text", side_effect=readings), \
-                 patch.object(power.os, "open") as opened:
+                 patch.object(power, "text", side_effect=readings) as read:
                 self.assertEqual(power.suspend_attempts(), expected)
-                opened.assert_not_called()
+                # These are kernel interface names, not configurable paths.
+                paths = Path("/sys/power/suspend_stats")
+                self.assertEqual(read.call_args_list,
+                                 [call(paths / name) for name in ("success", "fail")][:len(readings)])
 
 
 class MainLoopTests(HardwareFreeTests):

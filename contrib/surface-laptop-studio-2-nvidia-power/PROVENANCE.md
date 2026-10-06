@@ -38,9 +38,10 @@ provide the original context.
 Implementation and documentation used Codex assistance. Claude Code performed
 independent source reviews; findings and subsequent corrections were assessed
 locally. Claude Opus 5.5 reviewed the full licensed checkpoint `f44f799` at xhigh.
-Its follow-up adds suspend-attempt invalidation, startup source backoff and test/
-documentation corrections. These follow-up revisions have mocked regression
-coverage and local source assessment, without another independent review.
+The `aa4bd9e` follow-up adds suspend-attempt invalidation, startup source backoff,
+tests and documentation corrections. A focused Opus 5.5 xhigh re-review confirmed
+the prior dispositions and found no new P1/P2/P3 defects. Subsequent test and
+review-record corrections leave the runtime helper unchanged from that head.
 The 41 mocked tests, static unit checks and disposable user-manager lifecycle
 checks do not execute GPU controls or validate full system-manager hardening,
 RM/GSP behavior or system suspend. Neither AI review nor a passing mock replaces
