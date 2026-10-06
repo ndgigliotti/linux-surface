@@ -15,10 +15,15 @@ The RM layouts and control constants follow NVIDIA's published 595.71.05 sources
 - `src/common/sdk/nvidia/inc/nvos.h`: allocation, control and free parameters.
 - `src/common/sdk/nvidia/inc/class/cl0080.h`: device allocation parameters.
 - `src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080perf.h`: source/auxiliary controls.
+- `src/nvidia/arch/nvalloc/unix/include/nv_escape.h`: RM ioctl numbers.
+- `kernel-open/common/inc/nv-ioctl-numbers.h`: ioctl magic and register-FD number.
+- `src/common/sdk/nvidia/inc/class/cl2080.h`: subdevice class/allocation parameters.
 - `kernel-open/nvidia/nv-acpi.c`: the query fallback's target source.
 
 [NVIDIA's 595.71.05 source](https://github.com/NVIDIA/open-gpu-kernel-modules/tree/595.71.05)
-retains its own MIT notices; see [NVIDIA-LICENSE](NVIDIA-LICENSE). The bundled patch
+retains its own MIT notices; see [NVIDIA-LICENSE](NVIDIA-LICENSE). The helper
+also carries the RM declaration notices and permission text in its own header
+for installed copies. The bundled patch
 is the original narrow fallback, with the provider/PM defect disclosed in the
 README. A separate newer-driver redesign is not a backport or validation of it.
 
@@ -32,13 +37,19 @@ provide the original context.
 
 Implementation and documentation used Codex assistance. Claude Code performed
 independent source reviews; findings and subsequent corrections were assessed
-locally. Final feedback revisions have not received another independent review.
-The 38 mocked tests, static unit checks and disposable user-manager lifecycle
+locally. Claude Opus 5.5 reviewed the full licensed checkpoint `f44f799` at xhigh.
+Its follow-up adds suspend-attempt invalidation, startup source backoff and test/
+documentation corrections. These follow-up revisions have mocked regression
+coverage and local source assessment, without another independent review.
+The 41 mocked tests, static unit checks and disposable user-manager lifecycle
 checks do not execute GPU controls or validate full system-manager hardening,
 RM/GSP behavior or system suspend. Neither AI review nor a passing mock replaces
 those hardware checks. No same-version closed-module comparison was performed.
 
 [LICENSE](LICENSE) covers only `surface-nvidia-power.py`, `surface-nvidia-power.nix`,
 `surface-nvidia-power.service`, `test_surface_nvidia_power.py`, `README.md` and
-this document. It does not relicense NVIDIA's source/patch, historical diagnostic
-outputs or the rest of this repository.
+this document. NVIDIA declarations/patch retain their original MIT terms.
+Historical diagnostic outputs are factual records provided without an additional
+license grant here; no earlier output license is claimed, and third-party tool
+output is not assigned a new license. Their redistribution treatment remains a
+maintainer decision. Other repository licenses are unchanged.

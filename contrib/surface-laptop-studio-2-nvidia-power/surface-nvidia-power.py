@@ -1,6 +1,32 @@
 # SPDX-FileCopyrightText: 2026 Nicholas Gigliotti
 # SPDX-License-Identifier: MIT
 
+# Published NVIDIA RM declaration notices; sources are listed in PROVENANCE.md.
+# SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2001-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 1999-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2002-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
 """Surface Laptop Studio 2 NVIDIA auxiliary-power workaround (driver 595.71.05).
 
 The unbound Surface SGPC sends D5 on each GPU wake, selecting auxiliary P4.
@@ -30,6 +56,7 @@ INTERVAL = 0.2
 GUARD_EXIT_STATUS = 78
 NVIDIA_NODES = (Path("/dev/nvidiactl"), Path("/dev/nvidia0"))
 GPU_INFO = Path("/proc/driver/nvidia/gpus/0000:01:00.0/information")
+SUSPEND_STATS = Path("/sys/power/suspend_stats")
 stopping = False
 
 
@@ -219,10 +246,18 @@ def main():
         log(event="stopped")
         return 0
     previous = None
+    previous_attempts = None
     sleep_offset_upper = None
     log(event="started", driver=DRIVER, interval_ms=int(INTERVAL * 1000))
     try:
         while not stopping:
+            attempts = suspend_attempts()
+            if attempts is not None:
+                if previous_attempts is not None and attempts != previous_attempts:
+                    # An aborted suspend can resume devices without a clock gap.
+                    previous = None
+                    log(event="suspend_attempt")
+                previous_attempts = attempts
             lower, upper = sleep_offset_bounds()
             if sleep_offset_upper is not None and lower > sleep_offset_upper + 0.05:
                 # System sleep need not change runtime_suspended_time.
@@ -251,6 +286,14 @@ def main():
     return 0
 
 
+def suspend_attempts():
+    try:
+        return tuple(int(text(SUSPEND_STATS / name)) for name in ("success", "fail"))
+    except (OSError, ValueError):
+        # Older or restricted kernels may lack these; retain clock detection.
+        return None
+
+
 def sleep_offset_bounds():
     # BOOTTIME counts system sleep, MONOTONIC does not. Bracketing the sample
     # avoids mistaking scheduler delay between clock reads for system sleep.
@@ -264,6 +307,7 @@ def wait_for_source():
     # ADP1 can probe long after the device nodes. No RM operation has run yet,
     # so waiting here is safe and does not consume the runtime restart budget.
     waiting_logged = False
+    delay = INTERVAL
     while not stopping:
         try:
             read_power_source()
@@ -272,7 +316,8 @@ def wait_for_source():
             if not waiting_logged:
                 log(event="source_unavailable", error=str(error))
                 waiting_logged = True
-        time.sleep(INTERVAL)
+        time.sleep(delay)
+        delay = min(delay * 2, 5.0)
     return False
 
 

@@ -51,6 +51,18 @@ class HardwareFreeTests(unittest.TestCase):
         self.addCleanup(mock.stop)
 
 
+class SuspendCounterTests(HardwareFreeTests):
+    def test_counter_values_and_unavailable_fallback(self):
+        for readings, expected in ((["12", "3"], (12, 3)),
+                                   ([FileNotFoundError("unavailable")], None),
+                                   ([OSError("restricted")], None), (["unknown"], None)):
+            with self.subTest(readings=readings), \
+                 patch.object(power, "text", side_effect=readings), \
+                 patch.object(power.os, "open") as opened:
+                self.assertEqual(power.suspend_attempts(), expected)
+                opened.assert_not_called()
+
+
 class MainLoopTests(HardwareFreeTests):
     def setUp(self):
         super().setUp()
@@ -58,6 +70,9 @@ class MainLoopTests(HardwareFreeTests):
         mock.start()
         self.addCleanup(mock.stop)
         mock = patch.object(power, "verify_identity")
+        mock.start()
+        self.addCleanup(mock.stop)
+        mock = patch.object(power, "suspend_attempts", return_value=(0, 0))
         mock.start()
         self.addCleanup(mock.stop)
         mock = patch.object(power, "wait_for_devices", return_value=True)
@@ -132,6 +147,56 @@ class ResourceTests(HardwareFreeTests):
 
 
 class PolicyTests(MainLoopTests):
+    def test_suspend_attempt_reapplies_without_clock_or_runtime_change(self):
+        for changed in ((1, 0), (0, 1)):
+            with self.subTest(changed=changed):
+                stopped = MagicMock()
+                stopped.__bool__.side_effect = [False, False, False, False, True]
+                with patch.object(power, "verify_hardware"), \
+                     patch.object(power, "read_power_source", return_value="1"), \
+                     patch.object(power, "stopping", stopped), \
+                     patch.object(power.time, "sleep"), \
+                     patch.object(power, "sleep_offset_bounds", return_value=(0, 0.001)), \
+                     patch.object(power, "suspend_attempts", side_effect=[(0, 0), changed, changed]), \
+                     patch.object(power, "active_epoch", return_value=("100", "1")), \
+                     patch.object(power, "apply_power_source", return_value="1") as apply, \
+                     patch.object(power, "restore_firmware_restriction"), \
+                     patch.object(power, "log") as log:
+                    self.assertEqual(power.main(), 0)
+                    self.assertEqual(apply.call_count, 2)
+                    self.assertEqual(sum(c.kwargs.get("event") == "suspend_attempt"
+                                         for c in log.call_args_list), 1)
+
+    def test_unavailable_suspend_counter_keeps_last_valid_sample(self):
+        stopped = MagicMock()
+        stopped.__bool__.side_effect = [False, False, False, False, True]
+        with patch.object(power, "verify_hardware"), \
+             patch.object(power, "read_power_source", return_value="1"), \
+             patch.object(power, "stopping", stopped), \
+             patch.object(power.time, "sleep"), \
+             patch.object(power, "sleep_offset_bounds", return_value=(0, 0.001)), \
+             patch.object(power, "suspend_attempts", side_effect=[(0, 0), None, (0, 1)]), \
+             patch.object(power, "active_epoch", return_value=("100", "1")), \
+             patch.object(power, "apply_power_source", return_value="1") as apply, \
+             patch.object(power, "restore_firmware_restriction"), \
+             patch.object(power, "log"):
+            self.assertEqual(power.main(), 0)
+            self.assertEqual(apply.call_count, 2)
+
+    def test_suspend_attempt_never_opens_observed_idle_gpu(self):
+        stopped = MagicMock()
+        stopped.__bool__.side_effect = [False, False, False, True]
+        with patch.object(power, "verify_hardware"), \
+             patch.object(power, "read_power_source", return_value="1"), \
+             patch.object(power, "stopping", stopped), \
+             patch.object(power.time, "sleep"), \
+             patch.object(power, "suspend_attempts", side_effect=[(0, 0), (0, 1)]), \
+             patch.object(power, "text", return_value="suspended"), \
+             patch.object(power, "rm_device") as rm, \
+             patch.object(power, "log"):
+            self.assertEqual(power.main(), 0)
+            rm.assert_not_called()
+
     def test_system_resume_reapplies_policy_without_runtime_epoch_change(self):
         stopped = MagicMock()
         stopped.__bool__.side_effect = [False, False, False, False, True]
@@ -170,7 +235,11 @@ class PolicyTests(MainLoopTests):
             clock.assert_called_once_with(power.time.CLOCK_BOOTTIME)
 
     def test_later_driver_guard_failure_is_terminal_and_restore_is_safe(self):
-        with patch.object(power, "verify_hardware"), \
+        stopped = MagicMock()
+        stopped.__bool__.side_effect = [False, False, True]
+        with patch.object(power, "stopping", stopped), \
+             patch.object(power.time, "sleep"), \
+             patch.object(power, "verify_hardware"), \
              patch.object(power, "read_power_source", return_value="1"), \
              patch.object(power, "active_epoch", return_value=("100", "1")), \
              patch.object(power, "active_gpu_epoch", return_value="100"), \
@@ -265,15 +334,6 @@ class PolicyTests(MainLoopTests):
                 power.apply_power_source()
             rm.return_value.__exit__.assert_called_once()
 
-    def test_unknown_initial_source_does_not_allocate(self):
-        with patch.object(power, "verify_hardware"), \
-             patch.object(power, "text", return_value="unknown"), \
-             patch.object(power.time, "sleep", side_effect=lambda _: power.request_stop(signal.SIGTERM, None)), \
-             patch.object(power, "stopping", False), \
-             patch.object(power, "log"), \
-             patch.object(power, "rm_device") as rm:
-            self.assertEqual(power.main(), 0)
-            rm.assert_not_called()
 
     def test_shutdown_unknown_or_missing_source_restores_only_auxiliary_p4(self):
         for source in ("unknown", FileNotFoundError("adapter gone"), OSError("read failed")):
@@ -320,7 +380,7 @@ class PolicyTests(MainLoopTests):
 
     def test_failed_restore_preserves_original_error_and_logs_stop(self):
         stopped = MagicMock()
-        stopped.__bool__.return_value = False
+        stopped.__bool__.side_effect = [False, False, True]
         with patch.object(power, "verify_hardware"), \
              patch.object(power, "read_power_source", return_value="1"), \
              patch.object(power, "stopping", stopped), \
@@ -332,16 +392,6 @@ class PolicyTests(MainLoopTests):
                 power.main()
             self.assertEqual([entry.kwargs["event"] for entry in log.call_args_list],
                              ["started", "restore_failed", "stopped"])
-
-    def test_missing_source_before_allocation_does_not_open_gpu(self):
-        with patch.object(power, "verify_hardware"), \
-             patch.object(power, "text", side_effect=FileNotFoundError("adapter gone")), \
-             patch.object(power.time, "sleep", side_effect=lambda _: power.request_stop(signal.SIGTERM, None)), \
-             patch.object(power, "stopping", False), \
-             patch.object(power, "log"), \
-             patch.object(power, "rm_device") as rm:
-            self.assertEqual(power.main(), 0)
-            rm.assert_not_called()
 
 
 class GuardTests(MainLoopTests):
@@ -384,6 +434,18 @@ class GuardTests(MainLoopTests):
                 rm.assert_not_called()
                 self.assertEqual(log.call_args_list, [call(event="source_unavailable", error=str(error)),
                                                        call(event="stopped")])
+
+    def test_initial_source_errors_back_off_and_recover_without_rm(self):
+        with patch.object(power, "read_power_source",
+                          side_effect=[OSError("EC unavailable")] * 7 + ["1"]), \
+             patch.object(power.time, "sleep") as sleep, \
+             patch.object(power, "rm_device") as rm, \
+             patch.object(power, "log") as log:
+            self.assertTrue(power.wait_for_source())
+            self.assertEqual([entry.args[0] for entry in sleep.call_args_list],
+                             [0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0])
+            log.assert_called_once()
+            rm.assert_not_called()
 
     @staticmethod
     def hardware_text(path):
@@ -542,7 +604,9 @@ class ServiceStartupTests(HardwareFreeTests):
     @unittest.skipUnless(shutil.which("nix-instantiate"), "Nix evaluator unavailable")
     def test_nixos_module_policy_parity_and_driver_assertion(self):
         module = Path(__file__).with_name("surface-nvidia-power.nix").resolve()
-        expression = """
+
+        def evaluate(version):
+            expression = """
           let module = import (/. + %s) {
             config.hardware.nvidia.package.version = %s;
             pkgs = {
@@ -553,13 +617,17 @@ class ServiceStartupTests(HardwareFreeTests):
             inherit (module) assertions;
             service = module.systemd.services.surface-nvidia-power;
           }
-        """ % (json.dumps(str(module)), json.dumps(power.DRIVER))
-        result = subprocess.run(
-            ["nix-instantiate", "--eval", "--strict", "--json", "--expr", expression],
-            check=True, capture_output=True, text=True
-        )
-        evaluated = json.loads(result.stdout)
-        self.assertTrue(all(item["assertion"] for item in evaluated["assertions"]))
+            """ % (json.dumps(str(module)), json.dumps(version))
+            result = subprocess.run(
+                ["nix-instantiate", "--eval", "--strict", "--json", "--expr", expression],
+                check=True, capture_output=True, text=True
+            )
+            return json.loads(result.stdout)
+
+        evaluated = evaluate(power.DRIVER)
+        self.assertEqual([item["assertion"] for item in evaluated["assertions"]], [True])
+        rejected = evaluate("615.71.09")
+        self.assertEqual([item["assertion"] for item in rejected["assertions"]], [False])
         service = evaluated["service"]
         config = service["serviceConfig"]
         self.check_policy(service["unitConfig"], config)
@@ -592,6 +660,7 @@ power.verify_hardware = lambda: None
 power.wait_for_devices = lambda: True
 power.read_power_source = lambda: "1"
 power.active_epoch = lambda: None
+power.suspend_attempts = lambda: (0, 0)
 power.restore_firmware_restriction = lambda: None
 signal.signal(signal.SIGTERM, power.request_stop)
 raise SystemExit(power.main())

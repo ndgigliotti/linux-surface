@@ -14,8 +14,9 @@ and [NVIDIA power-source report](https://github.com/NVIDIA/open-gpu-kernel-modul
 ## What is included
 
 - `nvidia-power-source-fallback.patch`: query Linux's power_supply class when
-  NVIDIA has no ACPI `_PSR` device. This partial change corrects source reporting
-  but did **not** independently remove the observed 10 W restriction.
+  NVIDIA has no ACPI `_PSR` device. It reports Linux's power_supply state at
+  runtime, subject to the system-PM limitation below, and did **not**
+  independently remove the observed 10 W restriction.
 - `surface-nvidia-power.py`: based on the physically tested helper, with
   additional recovery and identity checks described below. It polls
   PCI runtime-state and AC-source sysfs files every 200 ms while active.
@@ -44,20 +45,28 @@ other hardware checks follow it so asynchronous driver probing can complete.
 A matching laptop without NVIDIA nodes remains in the wait until stopped.
 It logs `waiting_for_devices` while waiting; an active unit alone does not imply
 the policy loop has reached `started`.
-Fixed hardware/ABI guard failures log `rejected` and exit with status 78,
+Hardware/ABI mismatches or unreadable identity guards log `rejected` and exit
+with status 78,
 which both examples exclude from automatic restarts. An unavailable or unknown
 AC source at startup logs `source_unavailable` once and waits without GPU
 access or consuming restarts; charger registration and controller read failures
-are not permanent identity rejection. Runtime source failures exit for recovery.
+are not permanent identity rejection. Failed initial reads back off from 200 ms
+to five seconds to reduce repeated controller requests. A stop during that wait
+can take up to five seconds. Runtime source failures exit for recovery.
 Other runtime failures exit for service-level recovery after three seconds,
 rather than issuing privileged RM operations every polling interval. Recovery
 is bounded to 20 starts per 600 seconds, after which the unit remains failed
-until explicitly reset/restarted after resolving the problem.
+until explicitly reset/restarted after resolving the problem. Before a runtime
+failure exit, the helper attempts auxiliary P4 restoration on an observed active
+GPU. A running workload can regain the original restriction during the restart
+delay and subsequent startup/source wait, until the policy loop applies P0 again.
 
 The driver version and internal GPU's `Device Minor: 0` mapping are checked
 before each RM session and again after device open pins the module. A mismatch
 stops with status 78, including during subsequent wakes. This example does not
-support a different device mapping or multi-GPU layout.
+support a different device mapping or multi-GPU layout. A module unload/reload
+can leave stale device nodes but unreadable driver procfs during startup, causing
+terminal rejection; manually restart the service after the module is available.
 
 System sleep can leave the runtime-PM epoch unchanged. The loop therefore
 invalidates its source cache when the gap between `CLOCK_BOOTTIME` and
@@ -66,8 +75,11 @@ Monotonic readings bracket the boottime sample to exclude scheduling delays.
 It corrects policy at the next observed active GPU; it does not wake an idle GPU
 to apply policy. These clocks differ in their accounting of system sleep
 ([Linux clock documentation](https://man7.org/linux/man-pages/man2/clock_gettime.2.html)).
-Very short sleep intervals or an interrupted sleep without a detectable clock
-gap are not covered by this detection rule.
+The loop also invalidates on changes to `/sys/power/suspend_stats/success` or
+`fail`: an aborted suspend can resume devices without adding a clock gap. These
+reads do not request the Surface controller or open the GPU. If the counters are
+unavailable or unreadable, only clock detection remains. Hibernation still
+relies on the clock gap; very short gaps without a counter change are not covered.
 
 These additions have hardware-free regression coverage and configuration
 checks, but have not been activated or physically tested. The supplied physical
@@ -126,7 +138,8 @@ cache, startup guards or shutdown behavior. The scope string in the archived
 `gen16-postboot-validation.json` also describes that earlier helper; the evidence
 file is retained unchanged.
 
-A separate NVIDIA 615.71.09 driver contribution is under development and review.
+A separate [NVIDIA 615.71.09 driver proposal](https://github.com/ndgigliotti/open-gpu-kernel-modules/tree/surface-power-source-fallback)
+is under development and review; the linked fork is a changing review candidate.
 It is not bundled here, is not a reviewed 595 backport and has no physical runtime
 validation. This helper remains pinned to 595.71.05; compiled header/layout checks
 alone do not establish RM/GSP runtime compatibility with another driver.
@@ -250,12 +263,18 @@ evidence and an opt-in interim implementation; it does not replace that design.
 
 [LICENSE](LICENSE) applies to the standalone helper, Nix module, systemd unit,
 tests, this README and [PROVENANCE.md](PROVENANCE.md). Copyright notices identify
-Nicholas Gigliotti's contribution; NVIDIA's notices for the published RM definitions
-and driver source are retained in [NVIDIA-LICENSE](NVIDIA-LICENSE).
+Nicholas Gigliotti's contribution. NVIDIA's original notices for the published RM
+definitions are also embedded in the helper so installed copies retain them;
+[NVIDIA-LICENSE](NVIDIA-LICENSE) lists their source files and the driver notice.
+Those NVIDIA notices attribute the interface declarations, not the original
+helper logic.
 
 The NVIDIA patch retains the target source's existing MIT license and NVIDIA
 attribution. It is excluded from the standalone-file license grant. Diagnostic
-logs/JSON are historical outputs retained unchanged and are not relicensed here.
+logs/JSON are historical factual diagnostic records provided unchanged, without
+an additional license grant in this contribution. No prior output license is
+claimed; maintainers should decide how to include those records and third-party
+tool output. The standalone MIT choice does not assign rights in that output.
 This directory does not change any other repository or third-party license.
 
 The provenance document identifies the source revisions, physical evidence,
