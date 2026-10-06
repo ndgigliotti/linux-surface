@@ -94,8 +94,9 @@ The helper deliberately rejects a machine unless all of these match:
 
 The helper additionally requires a readable `0` or `1` source at
 `/sys/class/power_supply/ADP1/online` before starting its policy loop. Unlike
-identity rejection, temporary source unavailability is eligible for bounded
-service retries; ADP1 can register asynchronously during boot.
+identity rejection, startup source unavailability waits in-process without
+consuming service retries; ADP1 can register asynchronously during boot.
+Source failures after the policy loop starts use bounded service recovery.
 
 A different firmware, GPU model, driver or adapter layout requires review and
 new physical validation. Do not delete guards simply to make the helper run.
