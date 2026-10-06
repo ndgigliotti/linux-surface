@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Nicholas Gigliotti
+# SPDX-License-Identifier: MIT
+
 """Hardware-free contract checks; no real sysfs reads or NVIDIA ioctls."""
 import configparser
 import importlib.util

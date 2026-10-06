@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Nicholas Gigliotti
+# SPDX-License-Identifier: MIT
+
 { config, pkgs, ... }:
 let
   helper = pkgs.writeScriptBin "surface-nvidia-power" ''

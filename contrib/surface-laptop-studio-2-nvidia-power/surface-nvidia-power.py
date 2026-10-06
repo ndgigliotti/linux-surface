@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Nicholas Gigliotti
+# SPDX-License-Identifier: MIT
+
 """Surface Laptop Studio 2 NVIDIA auxiliary-power workaround (driver 595.71.05).
 
 The unbound Surface SGPC sends D5 on each GPU wake, selecting auxiliary P4.

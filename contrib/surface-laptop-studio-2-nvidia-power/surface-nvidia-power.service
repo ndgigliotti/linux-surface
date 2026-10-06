@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Nicholas Gigliotti
+# SPDX-License-Identifier: MIT
+
 [Unit]
 Description=Surface Laptop Studio 2 NVIDIA auxiliary-power workaround
 StartLimitIntervalSec=600
