@@ -1,4 +1,4 @@
-"""TINCAN's Surface/NVIDIA auxiliary-power workaround (driver 595.71.05).
+"""Surface Laptop Studio 2 NVIDIA auxiliary-power workaround (driver 595.71.05).
 
 The unbound Surface SGPC sends D5 on each GPU wake, selecting auxiliary P4.
 Use the published RM controls to report the real Linux power source and clear
@@ -26,7 +26,12 @@ DRIVER = "595.71.05"
 INTERVAL = 0.2
 GUARD_EXIT_STATUS = 78
 NVIDIA_NODES = (Path("/dev/nvidiactl"), Path("/dev/nvidia0"))
+GPU_INFO = Path("/proc/driver/nvidia/gpus/0000:01:00.0/information")
 stopping = False
+
+
+class GuardError(RuntimeError):
+    """A fixed identity/ABI mismatch that must not be retried automatically."""
 
 
 class Alloc(c.Structure):
@@ -86,11 +91,14 @@ def allocate(fd, client, parent, handle, klass, params=None):
 
 @contextmanager
 def rm_device():
+    verify_driver()
     ctl = gpu = None
     client = 0
     try:
         ctl = os.open("/dev/nvidiactl", os.O_RDWR | os.O_CLOEXEC)
         gpu = os.open("/dev/nvidia0", os.O_RDWR | os.O_CLOEXEC)
+        # Open FDs pin the module; check again across the check/open window.
+        verify_driver()
         ioctl(gpu, 201, c.c_int(ctl))
         client = allocate(ctl, 0, 0, 0, 0x41)
         device = allocate(ctl, client, client, 0x1001, 0x80, Device())
@@ -113,17 +121,28 @@ def control(fd, client, obj, cmd, state):
     return value.value
 
 
-def verify_hardware():
+def verify_identity():
     if tuple(c.sizeof(kind) for kind in (Alloc, Control, Device, Free)) != (32, 32, 56, 16):
         raise RuntimeError("Unexpected RM parameter sizes")
     if text("/sys/class/dmi/id/product_name") != "Surface Laptop Studio 2":
         raise RuntimeError("Unsupported laptop")
+
+
+def verify_driver():
+    if DRIVER not in text("/proc/driver/nvidia/version").split():
+        raise GuardError(f"RM ABI has only been validated with NVIDIA {DRIVER}")
+    fields = dict(line.split(":", 1) for line in text(GPU_INFO).splitlines() if ":" in line)
+    if fields.get("Device Minor", "").strip() != "0":
+        raise GuardError("Internal GPU is not NVIDIA device minor 0")
+
+
+def verify_hardware():
+    verify_identity()
     for name, expected in (("vendor", "0x10de"), ("device", "0x28a0"),
                            ("subsystem_vendor", "0x1414"), ("subsystem_device", "0x0083")):
         if text(GPU / name) != expected:
             raise RuntimeError(f"Unsupported GPU {name}")
-    if DRIVER not in text("/proc/driver/nvidia/version"):
-        raise RuntimeError(f"RM ABI has only been validated with NVIDIA {DRIVER}")
+    verify_driver()
     if not SGPC.exists() or (SGPC / "driver").exists():
         raise RuntimeError("SGPC missing or already controlled by another driver")
     hashes = [hashlib.sha256(path.read_bytes()).hexdigest()
@@ -180,6 +199,11 @@ def restore_firmware_restriction():
 
 
 def main():
+    try:
+        verify_identity()
+    except (OSError, RuntimeError) as error:
+        log(event="rejected", error=str(error))
+        return GUARD_EXIT_STATUS
     if not wait_for_devices():
         log(event="stopped")
         return 0
@@ -188,16 +212,22 @@ def main():
     except (OSError, RuntimeError) as error:
         log(event="rejected", error=str(error))
         return GUARD_EXIT_STATUS
-    try:
-        read_power_source()
-    except (OSError, RuntimeError) as error:
-        # ADP1 probes asynchronously; source availability is not identity.
-        log(event="source_unavailable", error=str(error))
-        return 1
+    if not wait_for_source():
+        log(event="stopped")
+        return 0
     previous = None
+    sleep_offset_upper = None
     log(event="started", driver=DRIVER, interval_ms=int(INTERVAL * 1000))
     try:
         while not stopping:
+            lower, upper = sleep_offset_bounds()
+            if sleep_offset_upper is not None and lower > sleep_offset_upper + 0.05:
+                # System sleep need not change runtime_suspended_time.
+                previous = None
+                log(event="system_resume")
+                sleep_offset_upper = upper
+            else:
+                sleep_offset_upper = upper if sleep_offset_upper is None else min(sleep_offset_upper, upper)
             epoch = active_epoch()
             if epoch is None:
                 previous = None
@@ -206,6 +236,9 @@ def main():
                 # Allocation may have observed a different source than epoch.
                 previous = (epoch[0], applied_online)
             time.sleep(INTERVAL)
+    except GuardError as error:
+        log(event="rejected", error=str(error))
+        return GUARD_EXIT_STATUS
     finally:
         try:
             restore_firmware_restriction()
@@ -213,6 +246,31 @@ def main():
             log(event="restore_failed", error=str(error))
         log(event="stopped")
     return 0
+
+
+def sleep_offset_bounds():
+    # BOOTTIME counts system sleep, MONOTONIC does not. Bracketing the sample
+    # avoids mistaking scheduler delay between clock reads for system sleep.
+    before = time.monotonic()
+    boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+    after = time.monotonic()
+    return boot - after, boot - before
+
+
+def wait_for_source():
+    # ADP1 can probe long after the device nodes. No RM operation has run yet,
+    # so waiting here is safe and does not consume the runtime restart budget.
+    waiting_logged = False
+    while not stopping:
+        try:
+            read_power_source()
+            return True
+        except (OSError, RuntimeError) as error:
+            if not waiting_logged:
+                log(event="source_unavailable", error=str(error))
+                waiting_logged = True
+        time.sleep(INTERVAL)
+    return False
 
 
 def wait_for_devices():
