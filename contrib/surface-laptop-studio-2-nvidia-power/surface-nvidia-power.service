@@ -1,15 +1,14 @@
 [Unit]
 Description=Surface Laptop Studio 2 NVIDIA auxiliary-power workaround
-# Retry missing device nodes even if creation takes longer than the start limit.
-StartLimitIntervalSec=0
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
 [Service]
 Type=simple
-# These checks only stat the nodes; they do not open or wake the GPU.
-ExecStartPre=/usr/bin/test -c /dev/nvidiactl
-ExecStartPre=/usr/bin/test -c /dev/nvidia0
+# The main process waits using stat only, without holding up target startup.
 ExecStart=/usr/bin/python3 /usr/local/libexec/surface-nvidia-power.py
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=3
 TimeoutStopSec=15
 NoNewPrivileges=true
@@ -19,8 +18,9 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 PrivateTmp=true
 DevicePolicy=closed
-DeviceAllow=/dev/nvidiactl rw
-DeviceAllow=/dev/nvidia0 rw
+# NVIDIA's reserved major/minors; no node needs to exist during cgroup setup.
+DeviceAllow=/dev/char/195:255 rw
+DeviceAllow=/dev/char/195:0 rw
 
 [Install]
 WantedBy=multi-user.target

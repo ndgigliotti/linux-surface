@@ -3,15 +3,17 @@
 The unbound Surface SGPC sends D5 on each GPU wake, selecting auxiliary P4.
 Use the published RM controls to report the real Linux power source and clear
 that auxiliary restriction. Native NVIDIA power/thermal limits still apply.
-Never open the GPU while idle; free every RM handle after each update.
+Only open a GPU observed active; free every RM handle after each update.
 """
+import argparse
 import ctypes as c
 import fcntl
 import hashlib
 import json
 import os
 import signal
-import threading
+import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -20,7 +22,11 @@ AC = Path("/sys/class/power_supply/ADP1/online")
 SGPC = Path("/sys/bus/platform/devices/MSHW0216:00")
 FIRMWARE_HASH = "86e842eae5254dbb6e5d04bd298db01d9b4505d4cc357d6b781afb40258dea99"
 U32, U64 = c.c_uint32, c.c_uint64
-stopping = threading.Event()
+DRIVER = "595.71.05"
+INTERVAL = 0.2
+GUARD_EXIT_STATUS = 78
+NVIDIA_NODES = (Path("/dev/nvidiactl"), Path("/dev/nvidia0"))
+stopping = False
 
 
 class Alloc(c.Structure):
@@ -46,15 +52,19 @@ class Free(c.Structure):
     _fields_ = [(name, U32) for name in ("root", "parent", "old", "status")]
 
 
-assert (c.sizeof(Alloc), c.sizeof(Control), c.sizeof(Device), c.sizeof(Free)) == (32, 32, 56, 16)
-
-
 def log(**fields):
     print(json.dumps(fields), flush=True)
 
 
 def text(path):
     return Path(path).read_text().strip()
+
+
+def read_power_source():
+    online = text(AC)
+    if online not in ("0", "1"):
+        raise RuntimeError("Unknown AC state")
+    return online
 
 
 def ioctl(fd, nr, params):
@@ -104,14 +114,16 @@ def control(fd, client, obj, cmd, state):
 
 
 def verify_hardware():
+    if tuple(c.sizeof(kind) for kind in (Alloc, Control, Device, Free)) != (32, 32, 56, 16):
+        raise RuntimeError("Unexpected RM parameter sizes")
     if text("/sys/class/dmi/id/product_name") != "Surface Laptop Studio 2":
         raise RuntimeError("Unsupported laptop")
     for name, expected in (("vendor", "0x10de"), ("device", "0x28a0"),
                            ("subsystem_vendor", "0x1414"), ("subsystem_device", "0x0083")):
         if text(GPU / name) != expected:
             raise RuntimeError(f"Unsupported GPU {name}")
-    if "595.71.05" not in text("/proc/driver/nvidia/version"):
-        raise RuntimeError("RM ABI has only been validated with NVIDIA 595.71.05")
+    if DRIVER not in text("/proc/driver/nvidia/version"):
+        raise RuntimeError(f"RM ABI has only been validated with NVIDIA {DRIVER}")
     if not SGPC.exists() or (SGPC / "driver").exists():
         raise RuntimeError("SGPC missing or already controlled by another driver")
     hashes = [hashlib.sha256(path.read_bytes()).hexdigest()
@@ -120,23 +132,24 @@ def verify_hardware():
         raise RuntimeError("GPU firmware differs from the diagnosed table; review before applying")
 
 
-def active_epoch():
+def active_gpu_epoch():
     # Sysfs reads do not wake PCI devices. Suspended-time changes also detect a
     # rapid D3cold cycle that occurs entirely between polling intervals.
     if text(GPU / "power/runtime_status") != "active" or text(GPU / "power_state") != "D0":
         return None
-    return text(GPU / "power/runtime_suspended_time"), text(AC)
+    return text(GPU / "power/runtime_suspended_time")
 
 
-def apply_power_source(online):
-    if online not in ("0", "1"):
-        raise RuntimeError("Unknown AC state")
+def active_epoch():
+    epoch = active_gpu_epoch()
+    return None if epoch is None else (epoch, read_power_source())
+
+
+def apply_power_source():
     with rm_device() as (fd, client, obj):
         # Re-read after allocation: the charger may have changed while RM was
         # resuming. SET_POWERSTATE retains NVIDIA's native AC/battery policy.
-        online = text(AC)
-        if online not in ("0", "1"):
-            raise RuntimeError("Unknown AC state")
+        online = read_power_source()
         source = 0 if online == "1" else 1
         control(fd, client, obj, 0x2080205B, source)
         control(fd, client, obj, 0x20802092, 0)
@@ -148,35 +161,83 @@ def apply_power_source(online):
 
 
 def restore_firmware_restriction():
-    if active_epoch() is None:
+    if active_gpu_epoch() is None:
         return  # Do not wake an idle device just to restore the next wake's D5.
     with rm_device() as (fd, client, obj):
-        source = 0 if text(AC) == "1" else 1
-        control(fd, client, obj, 0x2080205B, source)
+        try:
+            online = read_power_source()
+        except (OSError, RuntimeError) as error:
+            # Restore the conservative auxiliary restriction without inventing
+            # a source when the adapter disappeared or its read failed.
+            log(event="restore_source_unavailable", error=str(error))
+        else:
+            try:
+                control(fd, client, obj, 0x2080205B, 0 if online == "1" else 1)
+            except (OSError, RuntimeError) as error:
+                log(event="restore_source_failed", error=str(error))
         control(fd, client, obj, 0x20802092, 4)
         log(event="restored", auxiliary="P4")
 
 
 def main():
-    verify_hardware()
-    previous = None
-    log(event="started", driver="595.71.05", interval_ms=200)
+    if not wait_for_devices():
+        log(event="stopped")
+        return 0
     try:
-        while not stopping.is_set():
+        verify_hardware()
+    except (OSError, RuntimeError) as error:
+        log(event="rejected", error=str(error))
+        return GUARD_EXIT_STATUS
+    try:
+        read_power_source()
+    except (OSError, RuntimeError) as error:
+        # ADP1 probes asynchronously; source availability is not identity.
+        log(event="source_unavailable", error=str(error))
+        return 1
+    previous = None
+    log(event="started", driver=DRIVER, interval_ms=int(INTERVAL * 1000))
+    try:
+        while not stopping:
             epoch = active_epoch()
             if epoch is None:
                 previous = None
             elif epoch != previous:
-                applied_online = apply_power_source(epoch[1])
+                applied_online = apply_power_source()
                 # Allocation may have observed a different source than epoch.
                 previous = (epoch[0], applied_online)
-            stopping.wait(0.2)
+            time.sleep(INTERVAL)
     finally:
-        restore_firmware_restriction()
+        try:
+            restore_firmware_restriction()
+        except (OSError, RuntimeError) as error:
+            log(event="restore_failed", error=str(error))
         log(event="stopped")
+    return 0
+
+
+def wait_for_devices():
+    # Stat only. Waiting in this startup process does not consume the service's
+    # restart allowance and does not open either NVIDIA character device.
+    waiting_logged = False
+    while not stopping:
+        if all(node.is_char_device() for node in NVIDIA_NODES):
+            return True
+        if not waiting_logged:
+            log(event="waiting_for_devices")
+            waiting_logged = True
+        time.sleep(INTERVAL)
+    return False
+
+
+def request_stop(signum, frame):
+    # Python executes this in the main thread. Avoid Event/Condition locks:
+    # a handler can interrupt the same thread while it holds their lock.
+    global stopping
+    stopping = True
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda *_: stopping.set())
-    signal.signal(signal.SIGINT, lambda *_: stopping.set())
-    main()
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    sys.exit(main())

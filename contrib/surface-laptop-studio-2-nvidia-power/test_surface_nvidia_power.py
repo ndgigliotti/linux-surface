@@ -5,6 +5,9 @@ import json
 from pathlib import Path
 import shlex
 import shutil
+import selectors
+import signal
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -17,7 +20,29 @@ power = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(power)
 
 
-class ResourceTests(unittest.TestCase):
+class HardwareFreeTests(unittest.TestCase):
+    def setUp(self):
+        # Catch missing mocks even on a host where the requested path exists.
+        for name in ("read_text", "read_bytes", "stat"):
+            original = getattr(Path, name)
+            def guarded(path, *args, _original=original, **kwargs):
+                if str(path).startswith(("/sys/", "/proc/driver/nvidia/", "/dev/nvidia")):
+                    raise AssertionError(f"Unexpected host hardware read: {path}")
+                return _original(path, *args, **kwargs)
+            mock = patch.object(Path, name, guarded)
+            mock.start()
+            self.addCleanup(mock.stop)
+
+
+class MainLoopTests(HardwareFreeTests):
+    def setUp(self):
+        super().setUp()
+        mock = patch.object(power, "wait_for_devices", return_value=True)
+        mock.start()
+        self.addCleanup(mock.stop)
+
+
+class ResourceTests(HardwareFreeTests):
     def test_rm_client_and_fds_released_when_work_fails(self):
         with patch.object(power.os, "open", side_effect=[10, 11]), \
              patch.object(power.os, "close") as close, \
@@ -66,18 +91,20 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(close.call_args_list, [call(11), call(10)])
 
 
-class PolicyTests(unittest.TestCase):
+class PolicyTests(MainLoopTests):
     def test_idle_loop_and_shutdown_never_open_gpu(self):
         stopped = MagicMock()
-        stopped.is_set.side_effect = [False, False, True]
+        stopped.__bool__.side_effect = [False, False, True]
         with patch.object(power, "verify_hardware"), \
+             patch.object(power, "read_power_source", return_value="1"), \
              patch.object(power, "text", return_value="suspended"), \
              patch.object(power, "stopping", stopped), \
+             patch.object(power.time, "sleep") as sleep, \
              patch.object(power, "log"), \
              patch.object(power, "rm_device") as rm:
             power.main()
             rm.assert_not_called()
-            self.assertEqual(stopped.wait.call_args_list, [call(0.2), call(0.2)])
+            self.assertEqual(sleep.call_args_list, [call(power.INTERVAL), call(power.INTERVAL)])
 
     def test_live_source_is_reread_after_allocation(self):
         for online, expected in (("0", 1), ("1", 0)):
@@ -87,7 +114,7 @@ class PolicyTests(unittest.TestCase):
                  patch.object(power, "control", side_effect=[0, 0, expected]) as control, \
                  patch.object(power, "log"):
                 rm.return_value.__enter__.return_value = (10, 0xA, 0x1002)
-                applied = power.apply_power_source("1" if online == "0" else "0")
+                applied = power.apply_power_source()
                 self.assertEqual(applied, online)
                 self.assertEqual(control.call_args_list, [
                     call(10, 0xA, 0x1002, 0x2080205B, expected),
@@ -105,13 +132,14 @@ class PolicyTests(unittest.TestCase):
                     # the applied value, avoid another unnecessary GPU open.
                     sources = [applied, initial] if next_source == initial else [applied]
                     stopped = MagicMock()
-                    stopped.is_set.side_effect = [False, False, False, True]
+                    stopped.__bool__.side_effect = [False, False, False, True]
                     with patch.object(power, "verify_hardware"), \
                          patch.object(power, "active_epoch", side_effect=[
                              ("100", initial), ("100", next_source), ("100", next_source)
                          ]), \
-                         patch.object(power, "text", side_effect=sources), \
+                         patch.object(power, "text", side_effect=[initial, *sources]), \
                          patch.object(power, "stopping", stopped), \
+             patch.object(power.time, "sleep") as sleep, \
                          patch.object(power, "log"), \
                          patch.object(power, "restore_firmware_restriction"), \
                          patch.object(power, "rm_device") as rm, \
@@ -134,7 +162,7 @@ class PolicyTests(unittest.TestCase):
              patch.object(power, "control") as control:
             rm.return_value.__enter__.return_value = (10, 0xA, 0x1002)
             with self.assertRaisesRegex(RuntimeError, "Unknown AC"):
-                power.apply_power_source("1")
+                power.apply_power_source()
             control.assert_not_called()
             rm.return_value.__exit__.assert_called_once()
 
@@ -144,17 +172,115 @@ class PolicyTests(unittest.TestCase):
              patch.object(power, "control", side_effect=[0, 0, 1]):
             rm.return_value.__enter__.return_value = (10, 0xA, 0x1002)
             with self.assertRaisesRegex(RuntimeError, "readback mismatch"):
-                power.apply_power_source("1")
+                power.apply_power_source()
             rm.return_value.__exit__.assert_called_once()
 
     def test_unknown_initial_source_does_not_allocate(self):
-        with patch.object(power, "rm_device") as rm:
-            with self.assertRaisesRegex(RuntimeError, "Unknown AC"):
-                power.apply_power_source("unknown")
+        with patch.object(power, "verify_hardware"), \
+             patch.object(power, "text", return_value="unknown"), \
+             patch.object(power, "log"), \
+             patch.object(power, "rm_device") as rm:
+            self.assertEqual(power.main(), 1)
+            rm.assert_not_called()
+
+    def test_shutdown_unknown_or_missing_source_restores_only_auxiliary_p4(self):
+        for source in ("unknown", FileNotFoundError("adapter gone"), OSError("read failed")):
+            with self.subTest(source=source), \
+                 patch.object(power, "active_gpu_epoch", return_value="100"), \
+                 patch.object(power, "text", side_effect=[source]), \
+                 patch.object(power, "rm_device") as rm, \
+                 patch.object(power, "control") as control, \
+                 patch.object(power, "log") as log:
+                rm.return_value.__enter__.return_value = (10, 0xA, 0x1002)
+                power.restore_firmware_restriction()
+                control.assert_called_once_with(10, 0xA, 0x1002, 0x20802092, 4)
+                rm.return_value.__exit__.assert_called_once()
+                self.assertEqual(log.call_args_list[0].kwargs["event"], "restore_source_unavailable")
+
+    def test_shutdown_reports_valid_source_before_auxiliary_p4(self):
+        for source, state in (("0", 1), ("1", 0)):
+            with self.subTest(source=source), \
+                 patch.object(power, "active_gpu_epoch", return_value="100"), \
+                 patch.object(power, "text", return_value=source), \
+                 patch.object(power, "rm_device") as rm, \
+                 patch.object(power, "control") as control, \
+                 patch.object(power, "log"):
+                rm.return_value.__enter__.return_value = (10, 0xA, 0x1002)
+                power.restore_firmware_restriction()
+                self.assertEqual(control.call_args_list, [
+                    call(10, 0xA, 0x1002, 0x2080205B, state),
+                    call(10, 0xA, 0x1002, 0x20802092, 4),
+                ])
+
+    def test_shutdown_source_control_failure_still_attempts_auxiliary_p4(self):
+        with patch.object(power, "active_gpu_epoch", return_value="100"), \
+             patch.object(power, "text", return_value="1"), \
+             patch.object(power, "rm_device") as rm, \
+             patch.object(power, "control", side_effect=[RuntimeError("source failed"), 0]) as control, \
+             patch.object(power, "log") as log:
+            rm.return_value.__enter__.return_value = (10, 0xA, 0x1002)
+            power.restore_firmware_restriction()
+            self.assertEqual(control.call_args_list, [
+                call(10, 0xA, 0x1002, 0x2080205B, 0),
+                call(10, 0xA, 0x1002, 0x20802092, 4),
+            ])
+            self.assertEqual(log.call_args_list[0].kwargs["event"], "restore_source_failed")
+
+    def test_failed_restore_preserves_original_error_and_logs_stop(self):
+        stopped = MagicMock()
+        stopped.__bool__.return_value = False
+        with patch.object(power, "verify_hardware"), \
+             patch.object(power, "read_power_source", return_value="1"), \
+             patch.object(power, "stopping", stopped), \
+             patch.object(power.time, "sleep") as sleep, \
+             patch.object(power, "active_epoch", side_effect=RuntimeError("original failure")), \
+             patch.object(power, "restore_firmware_restriction", side_effect=OSError("restore failure")), \
+             patch.object(power, "log") as log:
+            with self.assertRaisesRegex(RuntimeError, "original failure"):
+                power.main()
+            self.assertEqual([entry.kwargs["event"] for entry in log.call_args_list],
+                             ["started", "restore_failed", "stopped"])
+
+    def test_missing_source_before_allocation_does_not_open_gpu(self):
+        with patch.object(power, "verify_hardware"), \
+             patch.object(power, "text", side_effect=FileNotFoundError("adapter gone")), \
+             patch.object(power, "log"), \
+             patch.object(power, "rm_device") as rm:
+            self.assertEqual(power.main(), 1)
             rm.assert_not_called()
 
 
-class GuardTests(unittest.TestCase):
+class GuardTests(MainLoopTests):
+    def test_guard_failures_return_nonretryable_status_without_gpu_access(self):
+        for error in (RuntimeError("unsupported"), OSError("guard read failed")):
+            with self.subTest(error=error), \
+                 patch.object(power, "verify_hardware", side_effect=error), \
+                 patch.object(power, "rm_device") as rm, \
+                 patch.object(power, "log") as log:
+                self.assertEqual(power.main(), power.GUARD_EXIT_STATUS)
+                rm.assert_not_called()
+                log.assert_called_once_with(event="rejected", error=str(error))
+
+    def test_unexpected_abi_sizes_refused_before_sysfs_access(self):
+        with patch.object(power.c, "sizeof", return_value=1), \
+             patch.object(power, "text") as text:
+            with self.assertRaisesRegex(RuntimeError, "Unexpected RM parameter sizes"):
+                power.verify_hardware()
+            text.assert_not_called()
+
+    def test_source_failures_are_retryable_after_identity_checks(self):
+        for error in (FileNotFoundError("adapter late"), OSError("transient EC error"),
+                      RuntimeError("Unknown AC state")):
+            with self.subTest(error=error), \
+                 patch.object(power, "verify_hardware") as verify, \
+                 patch.object(power, "read_power_source", side_effect=error), \
+                 patch.object(power, "rm_device") as rm, \
+                 patch.object(power, "log") as log:
+                self.assertEqual(power.main(), 1)
+                verify.assert_called_once()
+                rm.assert_not_called()
+                log.assert_called_once_with(event="source_unavailable", error=str(error))
+
     @staticmethod
     def hardware_text(path):
         name = str(path)
@@ -162,7 +288,7 @@ class GuardTests(unittest.TestCase):
             "product_name": "Surface Laptop Studio 2",
             "vendor": "0x10de", "device": "0x28a0",
             "subsystem_vendor": "0x1414", "subsystem_device": "0x0083",
-            "version": "NVIDIA Open Kernel Module 595.71.05",
+            "version": "NVIDIA Open Kernel Module " + power.DRIVER,
         }
         return values[name.rsplit("/", 1)[-1]]
 
@@ -202,79 +328,140 @@ class GuardTests(unittest.TestCase):
                 power.verify_hardware()
 
 
-class ServiceStartupTests(unittest.TestCase):
-    def check_late_device_nodes(self, prechecks, restart, interval, start_limit):
-        """Exercise stat-only startup gates; no running systemd or GPU access."""
-        self.assertEqual(restart, "on-failure")
-        self.assertEqual(int(interval), 3)
-        self.assertEqual(int(start_limit), 0)
-        commands = [shlex.split(command) for command in prechecks]
-        self.assertEqual([command[1:] for command in commands], [
-            ["-c", "/dev/nvidiactl"], ["-c", "/dev/nvidia0"]
-        ])
+class ServiceStartupTests(HardwareFreeTests):
+    def test_waits_for_both_character_devices_without_opening_them(self):
         with tempfile.TemporaryDirectory() as directory:
-            nodes = [Path(directory) / Path(command[-1]).name for command in commands]
+            nodes = [Path(directory) / name for name in ("nvidiactl", "nvidia0")]
+            phases = []
+            def advance(interval):
+                self.assertEqual(interval, power.INTERVAL)
+                phases.append(len(phases))
+                if len(phases) == 1:
+                    nodes[0].symlink_to("/dev/null")
+                elif len(phases) == 2:
+                    nodes[1].write_text("")
+                elif len(phases) == 3:
+                    nodes[1].unlink()
+                    nodes[1].symlink_to("/dev/null")
+                else:
+                    self.fail("Did not accept both character devices")
+            with patch.object(power, "NVIDIA_NODES", nodes), \
+                 patch.object(power, "stopping", False), \
+                 patch.object(power.time, "sleep", side_effect=advance), \
+                 patch.object(power.os, "open") as opened:
+                self.assertTrue(power.wait_for_devices())
+                self.assertEqual(len(phases), 3)
+                opened.assert_not_called()
 
-            def gates_pass():
-                return all(subprocess.run(
-                    [command[0], command[1], str(node)], check=False
-                ).returncode == 0 for command, node in zip(commands, nodes))
+    def test_startup_wait_stops_on_signal_flag(self):
+        with patch.object(power, "stopping", False), \
+             patch.object(power, "NVIDIA_NODES", [Path("/nonexistent-candidate-test-node")]), \
+             patch.object(power.time, "sleep", side_effect=lambda _: power.request_stop(signal.SIGTERM, None)):
+            self.assertFalse(power.wait_for_devices())
+            self.assertTrue(power.stopping)
 
-            self.assertFalse(gates_pass())
-            nodes[0].symlink_to("/dev/null")
-            self.assertFalse(gates_pass())
-            # A regular file cannot satisfy the character-device requirement.
-            nodes[1].touch()
-            self.assertFalse(gates_pass())
-            nodes[1].unlink()
-            nodes[1].symlink_to("/dev/null")
-            self.assertTrue(gates_pass())
-
-    def test_conventional_unit_retries_late_device_nodes(self):
-        unit_text = Path(__file__).with_name("surface-nvidia-power.service").read_text()
+    @staticmethod
+    def conventional_unit():
+        text = Path(__file__).with_name("surface-nvidia-power.service").read_text()
         unit = configparser.ConfigParser(strict=False)
-        unit.read_string(unit_text)
-        self.assertFalse(any(key.startswith("condition") for key in unit["Unit"]))
-        prechecks = [line.split("=", 1)[1] for line in unit_text.splitlines()
-                     if line.startswith("ExecStartPre=")]
-        # The conventional example's /usr/bin path is distribution-specific.
-        # Use the installed test binary for these hardware-free checks.
-        test = shutil.which("test")
-        if test is None:
-            self.skipTest("test executable unavailable")
-        prechecks = [shlex.join([test, *shlex.split(command)[1:]]) for command in prechecks]
-        self.check_late_device_nodes(prechecks, unit["Service"]["Restart"],
-                                   unit["Service"]["RestartSec"],
-                                   unit["Unit"]["StartLimitIntervalSec"])
+        unit.optionxform = str
+        unit.read_string(text)
+        return unit
+
+    def check_policy(self, unit, config):
+        self.assertFalse(any(key.startswith("Condition") for key in unit))
+        self.assertEqual(int(unit["StartLimitIntervalSec"]), 600)
+        self.assertEqual(int(unit["StartLimitBurst"]), 20)
+        self.assertEqual(config["Restart"], "on-failure")
+        self.assertEqual(int(config["RestartSec"]), 3)
+        self.assertEqual(int(config["RestartPreventExitStatus"]), power.GUARD_EXIT_STATUS)
+        self.assertEqual(config["Type"], "simple")
+        self.assertNotIn("ExecStartPre", config)
+        self.assertNotIn("TimeoutStartSec", config)
+
+    def test_conventional_unit_startup_wait_and_bounded_restart_policy(self):
+        unit = self.conventional_unit()
+        self.check_policy(unit["Unit"], unit["Service"])
 
     @unittest.skipUnless(shutil.which("nix-instantiate"), "Nix evaluator unavailable")
-    def test_nixos_module_retries_late_device_nodes(self):
-        test = shutil.which("test")
-        if test is None:
-            self.skipTest("test executable unavailable")
+    def test_nixos_module_policy_parity_and_driver_assertion(self):
         module = Path(__file__).with_name("surface-nvidia-power.nix").resolve()
-        # Evaluate only this module with stub packages, without NixOS evaluation,
-        # fetching nixpkgs, a build, or activation.
         expression = """
-          let module = import (builtins.toPath %s) {
-            config.hardware.nvidia.package.version = "595.71.05";
+          let module = import (/. + %s) {
+            config.hardware.nvidia.package.version = %s;
             pkgs = {
-              coreutils = %s;
               python3 = "/unused/python3";
               writeScriptBin = name: script: "/unused/helper";
             };
-          }; in module.systemd.services.surface-nvidia-power
-        """ % (json.dumps(str(module)), json.dumps(str(Path(test).parent.parent)))
+          }; in {
+            inherit (module) assertions;
+            service = module.systemd.services.surface-nvidia-power;
+          }
+        """ % (json.dumps(str(module)), json.dumps(power.DRIVER))
         result = subprocess.run(
             ["nix-instantiate", "--eval", "--strict", "--json", "--expr", expression],
             check=True, capture_output=True, text=True
         )
-        service = json.loads(result.stdout)
-        self.assertFalse(any(key.startswith("Condition") for key in service["unitConfig"]))
+        evaluated = json.loads(result.stdout)
+        self.assertTrue(all(item["assertion"] for item in evaluated["assertions"]))
+        service = evaluated["service"]
         config = service["serviceConfig"]
-        self.check_late_device_nodes(config["ExecStartPre"], config["Restart"],
-                                   config["RestartSec"],
-                                   service["unitConfig"]["StartLimitIntervalSec"])
+        self.check_policy(service["unitConfig"], config)
+        unit = self.conventional_unit()
+        # Parse repeated DeviceAllow separately; ConfigParser retains the last.
+        unit_text = Path(__file__).with_name("surface-nvidia-power.service").read_text()
+        conventional = dict(unit["Service"])
+        conventional["DeviceAllow"] = [line.split("=", 1)[1] for line in unit_text.splitlines()
+                                       if line.startswith("DeviceAllow=")]
+        for settings in (conventional, config):
+            settings["ExecStart"] = "<packaged helper>"
+            for name, value in list(settings.items()):
+                if isinstance(value, bool):
+                    settings[name] = str(value).lower()
+                elif isinstance(value, int):
+                    settings[name] = str(value)
+        self.assertEqual(conventional, config)
+
+
+class SignalTests(HardwareFreeTests):
+    def test_sigterm_exits_idle_loop_and_logs_stop(self):
+        helper = Path(__file__).with_name("surface-nvidia-power.py").resolve()
+        script = """
+import importlib.util, signal
+spec = importlib.util.spec_from_file_location("candidate", %s)
+power = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(power)
+power.verify_hardware = lambda: None
+power.wait_for_devices = lambda: True
+power.read_power_source = lambda: "1"
+power.active_epoch = lambda: None
+power.restore_firmware_restriction = lambda: None
+signal.signal(signal.SIGTERM, power.request_stop)
+raise SystemExit(power.main())
+""" % json.dumps(str(helper))
+        process = subprocess.Popen([sys.executable, "-B", "-c", script],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                self.assertTrue(selector.select(timeout=5), "Dummy loop did not start")
+                self.assertEqual(json.loads(process.stdout.readline())["event"], "started")
+            process.send_signal(signal.SIGTERM)
+            output, errors = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, errors)
+            self.assertEqual(json.loads(output.strip())["event"], "stopped")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    def test_unknown_argument_rejected_before_hardware_access(self):
+        helper = Path(__file__).with_name("surface-nvidia-power.py").resolve()
+        result = subprocess.run([sys.executable, "-B", str(helper), "--wait-for-device"],
+                                capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments", result.stderr)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

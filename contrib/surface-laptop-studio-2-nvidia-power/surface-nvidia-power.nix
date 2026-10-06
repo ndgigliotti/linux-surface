@@ -15,16 +15,16 @@ in
   systemd.services.surface-nvidia-power = {
     description = "Restore Surface NVIDIA native power policy after RTD3 wake";
     wantedBy = [ "multi-user.target" ];
-    # Retry late device-node creation instead of permanently skipping startup.
-    unitConfig.StartLimitIntervalSec = 0;
+    unitConfig = {
+      StartLimitIntervalSec = 600;
+      StartLimitBurst = 20;
+    };
     serviceConfig = {
-      # Stat only: no device open or GPU wake while waiting for the nodes.
-      ExecStartPre = [
-        "${pkgs.coreutils}/bin/test -c /dev/nvidiactl"
-        "${pkgs.coreutils}/bin/test -c /dev/nvidia0"
-      ];
+      Type = "simple";
+      # The main process waits with stat only; Type=simple completes startup.
       ExecStart = "${helper}/bin/surface-nvidia-power";
       Restart = "on-failure";
+      RestartPreventExitStatus = 78;
       RestartSec = 3;
       TimeoutStopSec = 15;
       NoNewPrivileges = true;
@@ -35,8 +35,8 @@ in
       PrivateTmp = true;
       DevicePolicy = "closed";
       DeviceAllow = [
-        "/dev/nvidiactl rw"
-        "/dev/nvidia0 rw"
+        "/dev/char/195:255 rw"
+        "/dev/char/195:0 rw"
       ];
     };
   };

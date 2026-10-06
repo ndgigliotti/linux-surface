@@ -15,12 +15,14 @@ and [NVIDIA power-source report](https://github.com/NVIDIA/open-gpu-kernel-modul
   but did **not** independently remove the observed 10 W restriction.
 - `surface-nvidia-power.py`: based on the physically tested helper, with the
   review fixes described below. It polls
-  read-only PCI runtime-state and AC-source sysfs files every 200 ms. After
+  PCI runtime-state and AC-source sysfs files every 200 ms while active.
+  PCI state reads do not wake the GPU; AC-source reads request the Surface
+  controller. After
   observing an active D0 GPU, it creates a temporary NVIDIA RM client, reports
   actual AC/battery state, selects auxiliary P0 and verifies source readback.
   Every update releases the client and device descriptors.
 - `surface-nvidia-power.nix`: based on the tested NixOS service module, with
-  startup retries added after review and an assertion for NVIDIA 595.71.05.
+  startup waiting/recovery added after review and an assertion for NVIDIA 595.71.05.
   It does not itself apply the driver patch.
 - `surface-nvidia-power.service`: conventional systemd-unit example, adapted
   from that module; this unit has not been activated on another distribution.
@@ -32,11 +34,19 @@ and [NVIDIA power-source report](https://github.com/NVIDIA/open-gpu-kernel-modul
 The post-review helper caches the AC/battery source actually applied after RM
 allocation, so a rapid charger transition cannot leave an obsolete source
 cached indefinitely. An unknown source at that re-read fails before policy
-controls are issued. Both service examples check for the NVIDIA character
-device nodes before starting the helper and retry every three seconds if they
-are absent. These checks only stat the nodes. Start-rate limiting is disabled
-so delayed node creation cannot exhaust the retries; other service failures
-also continue to retry until the service is stopped.
+controls are issued. The helper waits by statting both NVIDIA character-device
+nodes in its main process. Both service examples use `Type=simple`, so this wait
+finishes the service start job immediately without blocking boot targets or
+consuming restart attempts. It logs `waiting_for_devices` while waiting; an
+active unit alone does not imply the policy loop has reached `started`.
+Fixed hardware/ABI guard failures log `rejected` and exit with status 78,
+which both examples exclude from automatic restarts. An unavailable or unknown
+AC source logs `source_unavailable` and exits with retryable status 1; charger
+registration and controller read failures are not permanent identity rejection.
+Other runtime failures exit for service-level recovery after three seconds,
+rather than issuing privileged RM operations every polling interval. Recovery
+is bounded to 20 starts per 600 seconds, after which the unit remains failed
+until explicitly reset/restarted after resolving the problem.
 
 These review fixes have hardware-free regression coverage and configuration
 checks, but have not been activated or physically tested. The supplied physical
@@ -62,7 +72,11 @@ The helper deliberately rejects a machine unless all of these match:
 - SGPC platform device `MSHW0216:00` exists without a bound driver.
 - A GPU SSDT has SHA-256
   `86e842eae5254dbb6e5d04bd298db01d9b4505d4cc357d6b781afb40258dea99`.
-- AC source is exposed at `/sys/class/power_supply/ADP1/online`.
+
+The helper additionally requires a readable `0` or `1` source at
+`/sys/class/power_supply/ADP1/online` before starting its policy loop. Unlike
+identity rejection, temporary source unavailability is eligible for bounded
+service retries; ADP1 can register asynchronously during boot.
 
 A different firmware, GPU model, driver or adapter layout requires review and
 new physical validation. Do not delete guards simply to make the helper run.
@@ -82,7 +96,11 @@ Float throughput was **14.25384 TFLOPS** versus **1.24670 TFLOPS** under the cap
 a second wake produced **13.63473 TFLOPS**. Both returned to
 D3cold/suspended with runtime usage zero, and the idle helper had no GPU FDs.
 Battery computation and live AC -> battery -> AC transitions passed earlier
-with helper code differing only by a trailing blank line.
+with the pre-review helper differing from the installed gen16 helper only by a
+trailing blank line. Those results do not validate this revised helper's source
+cache, startup guards or shutdown behavior. The scope string in the archived
+`gen16-postboot-validation.json` also describes that earlier helper; the evidence
+file is retained unchanged.
 
 The C query fallback applies to NVIDIA main 615.71.09, but that release has
 not been built or physically tested here. The helper still refuses that driver.
@@ -95,15 +113,38 @@ establish that unconditional P0 is appropriate for other chargers or systems.
 Alternative/undersized chargers, docks/external displays, system suspend/wake,
 repeated inference and measured electrical/battery savings remain unvalidated.
 
+The bundled NVIDIA query fallback has an unresolved system-suspend provider
+ordering defect. Review of an existing 595.71.05 kernel trace found the fallback
+requesting Surface power-supply properties while the SSAM controller was not
+started, producing controller warnings. Failed provider reads can be masked as
+"not supplied" by the Linux helper, allowing a successful battery report rather
+than an unknown/error result. The final query output and any link to nearby GSP
+or suspend failures were not captured or proved. This needs a separate driver
+design fix before validated deployment; the earlier bounded compute/idle tests
+do not establish system-suspend correctness.
+
 There can be up to a polling interval of userspace correction delay. The active
 sysfs check and subsequent device open are not atomic: suspend can race the
 open. The helper is not a guarantee that a GPU can never wake in that window.
 Repeated measured returns to idle D3cold are the established result.
 
-Stopping the helper restores auxiliary P4 if the GPU is observed active; it
+Stopping the helper attempts to restore auxiliary P4 if the GPU is observed active; it
 does not intentionally open an observed idle GPU just to restore the next
-wake's firmware restriction. A hard process kill bypasses that restoration.
+wake's firmware restriction. If the adapter is unknown or unreadable during
+shutdown, it logs `restore_source_unavailable` and restores P4 without reporting
+an invented AC/battery source. A failed RM source report logs
+`restore_source_failed` and still attempts P4. Other restoration errors log `restore_failed`;
+the `stopped` record is still emitted. Restoration is best effort, and a hard
+process kill bypasses it.
 After removal, firmware D5 on a later wake can restore the original cap.
+
+The full system-manager hardening and device cgroup rules still need validation.
+The examples allow NVIDIA's reserved character-device major/minors `195:255`
+(control) and `195:0` (GPU0) using `/dev/char/` specifications. Systemd parses
+those numbers without requiring device nodes during cgroup setup, so late node
+creation does not omit the allow rules. The configured node names/numbers are
+specific to this example; review other layouts before adapting it. The
+hardware-free user-manager lifecycle check does not enforce device cgroups.
 
 ## Installation example
 
@@ -125,8 +166,8 @@ table reads. Python uses only its standard library on the tested 64-bit ABI.
    using `overrideAttrs`. Pin the matching driver version. The module's
    version assertion is intentional. Review/build the candidate before any
    attended activation; preserve tested boot/recovery paths.
-4. On a conventional systemd distribution, adapt the unit's Python and `test`
-   executable paths, then
+4. On a conventional systemd distribution, adapt the unit's Python executable
+   path, then
    install the helper at `/usr/local/libexec/surface-nvidia-power.py` and the
    unit at `/etc/systemd/system/surface-nvidia-power.service`. Enable it only
    after the guards and matching patched module are validated. This packaging
@@ -140,10 +181,16 @@ Run the hardware-free tests without root or GPU access:
 python3 -m unittest discover -s . -p 'test_surface_nvidia_power.py' -v
 ```
 
-The startup checks use the installed `test` executable against temporary paths
-and symlinks to `/dev/null`; they do not open NVIDIA devices or start services.
+The startup-wait tests stat temporary paths and symlinks to `/dev/null`; they
+do not open NVIDIA devices or start services. The signal test uses a child
+process with hardware access mocked out, sends SIGTERM, and checks clean exit.
+Unexpected host sysfs/NVIDIA path reads in the in-process tests fail immediately.
+Earlier intermediate suites omitted one AC-source mock; their pass depended
+on ADP1 availability. That omission is fixed in the supplied suite.
 The NixOS module check uses `nix-instantiate` with stub packages, without fetching,
-building or activation, and is skipped if Nix is unavailable.
+building or activation, and is skipped if Nix is unavailable. These checks assert
+startup wait, bounded restart policy, driver assertion and parity between the two examples; they do not
+exercise systemd retries or enforce the hardening directives.
 
 For physical validation, record charger, display/dock, firmware, kernel and
 driver. Verify Intel default rendering and NVIDIA offload, then run a bounded
